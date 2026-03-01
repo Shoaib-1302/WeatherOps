@@ -1,0 +1,16 @@
+streamlit
+geopandas
+pandas
+numpy
+folium
+streamlit-folium
+shapely
+plotly
+requests
+reportlab
+scikit-learn
+xgboost
+imbalanced-learn
+shap
+matplotlib
+seaborn
