@@ -1,5 +1,5 @@
 """
-WeatherOps v5.0 — Agentic GeoAI Weather Impact Decision Platform
+WeatherOps — Agentic GeoAI Weather Impact Decision Platform
 Agents: Ingestion · Modeling · Hazards · Decision · Evaluation
 """
 
@@ -12,7 +12,8 @@ import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-from shapely.geometry import Point
+from shapely.geometry import Point, MultiPoint
+from shapely.ops import voronoi_diagram
 from datetime import datetime, timedelta
 import math, tempfile, os
 from pathlib import Path
@@ -357,19 +358,19 @@ class EvaluationAgent:
         "Flood":     {"leaked":["river_distance","drainage_distance"],
                       "why":"flood_occurred is river-proximity rule → direct leakage if included",
                       "fix":"Exclude river_distance and drainage_distance from features",
-                      "expect":"AUC 0.82–0.86"},
+                      "auc_range":"AUC 0.82–0.86"},
         "Heat":      {"leaked":["LST_C_mean"],
                       "why":"LST_C_mean IS the label — cannot be a feature",
                       "fix":"Use temp_C, elevation, aspect, lat, lon only; LST uncorrelated (r=0.019)",
-                      "expect":"AUC 0.50–0.55 (correct — data limitation)"},
+                      "auc_range":"AUC 0.50–0.55 (correct — data limitation)"},
         "Wind":      {"leaked":["wind_kmh in features"],
                       "why":"wind_kmh is target, not terrain. IDW wind ≠ terrain physics",
                       "fix":"Terrain-only: elevation, slope, aspect, lat, lon, flow_accumulation",
-                      "expect":"R² 0.03–0.12 (honest — IDW field doesn't reflect orography)"},
+                      "auc_range":"R² 0.03–0.12 (honest — IDW field doesn't reflect orography)"},
         "Landslide": {"leaked":["slope","TWI","rainfall_3h"],
                       "why":"slope is label; TWI collinear r=−0.884; rainfall_3h zone-encoded (r=0.80 lon)",
                       "fix":"Use elevation, aspect, soil_moisture, engineered elev_deviation",
-                      "expect":"AUC 0.82–0.86"},
+                      "auc_range":"AUC 0.70–0.85"},
     }
 
     # ── Matplotlib dark style ─────────────────────────────────────
@@ -544,7 +545,7 @@ class EvaluationAgent:
             ("flood",     "🌊 Flood",     "flood",  "clf"),
             ("heat",      "🔥 Heat",      "heat",   "clf"),
             ("wind",      "💨 Wind",      "wind",   "reg"),
-            ("landslide", "⛰️ Landslide", "landslide","clf"),
+            ("landslide", "⛰ Landslide", "landslide","clf"),
         ]
         results = {}
         for step, (hkey, hname, tkey, task) in enumerate(hazards_cfg):
@@ -646,55 +647,369 @@ class EvaluationAgent:
 # ============================================================
 # SPATIAL / MAP UTILITIES
 # ============================================================
+
+# ── 6 Official Dehradun Development Blocks ───────────────────
+# Label points used as Voronoi seeds; cells clipped to district ROI
+# Sources: Uttarakhand Census 2011, SDMA block HQ records
+# ============================================================
+DEHRADUN_BLOCKS = {
+    "Chakrata": {
+        "color": "#a78bfa",
+        "label_lat": 30.70,
+        "label_lon": 77.87,
+        "area_km2": 1481,
+        "villages": 412,
+        "hq": "Chakrata",
+        "notes": "Northern highland block · Tons valley · Jaunsar-Bawar forest",
+    },
+    "Kalsi": {
+        "color": "#60a5fa",
+        "label_lat": 30.43,
+        "label_lon": 77.77,
+        "area_km2": 267,
+        "villages": 98,
+        "hq": "Kalsi",
+        "notes": "Yamuna-Tons corridor · NH-707 · Ashokan Edict site",
+    },
+    "Vikasnagar": {
+        "color": "#34d399",
+        "label_lat": 30.30,
+        "label_lon": 77.78,
+        "area_km2": 697,
+        "villages": 231,
+        "hq": "Vikasnagar",
+        "notes": "Western valley block · Suswa basin · Herbertpur · Selaqui",
+    },
+    "Raipur": {
+        "color": "#f0a500",
+        "label_lat": 30.38,
+        "label_lon": 78.10,
+        "area_km2": 430,
+        "villages": 163,
+        "hq": "Raipur",
+        "notes": "Central-eastern block · Dehradun city core · Rispana & Bindal",
+    },
+    "Sahaspur": {
+        "color": "#f472b6",
+        "label_lat": 30.39,
+        "label_lon": 77.86,
+        "area_km2": 360,
+        "villages": 144,
+        "hq": "Sahaspur",
+        "notes": "North-eastern peri-urban block · Song river catchment",
+    },
+    "Doiwala": {
+        "color": "#fb923c",
+        "label_lat": 30.17,
+        "label_lon": 78.12,
+        "area_km2": 312,
+        "villages": 120,
+        "hq": "Doiwala",
+        "notes": "Southern floodplain block · Jolly Grant Airport · Rajaji Park fringe",
+    },
+}
+
+
+def _build_block_voronoi(roi_gdf):
+    """
+    Build Voronoi cells from DEHRADUN_BLOCKS seed points, clipped to district ROI.
+    Returns dict {block_name: shapely.geometry.Polygon}.
+    """
+    try:
+        roi_union = roi_gdf.geometry.union_all()
+    except Exception:
+        roi_union = roi_gdf.unary_union
+
+    pts   = []
+    names = []
+    for name, info in DEHRADUN_BLOCKS.items():
+        pts.append(Point(float(info["label_lon"]), float(info["label_lat"])))
+        names.append(name)
+
+    if len(pts) < 2:
+        return {}
+
+    env = roi_union.envelope.buffer(0.5)
+    try:
+        vgeom = voronoi_diagram(MultiPoint(pts), envelope=env, edges=False)
+    except Exception:
+        return {}
+
+    polys  = [g for g in getattr(vgeom, "geoms", []) if g.geom_type == "Polygon"]
+    cells  = {}
+    for name, pt in zip(names, pts):
+        chosen = None
+        for poly in polys:
+            if poly.contains(pt) or poly.touches(pt):
+                chosen = poly
+                break
+        if chosen is None and polys:
+            chosen = min(polys, key=lambda z: z.distance(pt))
+        if chosen is None:
+            continue
+        g = chosen.intersection(roi_union)
+        if g.is_empty:
+            continue
+        if not g.is_valid:
+            g = g.buffer(0)
+        if g.geom_type == "MultiPolygon":
+            g = max(g.geoms, key=lambda z: z.area)
+        if g.geom_type == "Polygon":
+            cells[name] = g
+    return cells
+
+
+# ── Named Locations — Dehradun District ──────────────────────
+DEHRADUN_LOCATIONS = [
+    ("Dehradun City Centre",      30.3165, 78.0322, ["Flood","Heat","Wind"],     640,  "District HQ · Clock Tower area"),
+    ("Paltan Bazaar",             30.3245, 78.0409, ["Heat","Flood"],            638,  "Dense commercial zone · heat island"),
+    ("Rajpur Road",               30.3456, 78.0645, ["Heat","Wind"],             700,  "Urban arterial · canopy cover"),
+    ("ISBT Dehradun",             30.3078, 78.0234, ["Flood","Heat"],            630,  "Inter-state bus terminal · low-lying"),
+    ("Prem Nagar",                30.2892, 78.0156, ["Flood"],                   610,  "Flood-prone · near Rispana River"),
+    ("Dalanwala",                 30.3312, 78.0534, ["Heat"],                    650,  "Residential · urban heat exposure"),
+    ("Niranjanpur",               30.2934, 78.0489, ["Flood","Heat"],            625,  "Semi-urban · Rispana floodplain"),
+    ("Rispana River — Patel Nagar Bridge", 30.3023, 78.0312, ["Flood"],         628,  "Flood-critical crossing · Rispana"),
+    ("Bindal River — Ladpur",     30.3612, 78.0756, ["Flood"],                   660,  "Seasonal flash flood zone"),
+    ("Song River — Doiwala",      30.1823, 78.1234, ["Flood"],                   512,  "Song River floodplain · Doiwala block"),
+    ("Dakpathar Barrage",          30.2434, 77.9423, ["Flood"],                   536,  "Tons–Yamuna confluence zone"),
+    ("Suswa River — Selaqui",     30.3567, 77.8923, ["Flood"],                   650,  "Suswa floodplain · industrial zone"),
+    ("Mussoorie Road — Kimberley",30.4523, 78.0756, ["Landslide","Wind"],       1400,  "Slope >30° · debris flow history"),
+    ("Sahastradhara",             30.3934, 78.1123, ["Landslide"],              1050,  "Active slide zone · sulphur springs"),
+    ("Maldevta",                  30.3756, 78.1312, ["Landslide","Flood"],       900,  "2022 flash flood site"),
+    ("Chakrata Road — Kalsi",     30.5234, 77.8456, ["Landslide","Wind"],       1150,  "NH-707 slide-prone corridor"),
+    ("Vikasnagar",                30.4612, 77.7645, ["Landslide"],               890,  "Chakrata–Vikasnagar vulnerable stretch"),
+    ("Mussorie — Landour",        30.4756, 78.1023, ["Landslide","Wind"],       2000,  "Steep ridge · historic slides"),
+    ("Benog Tibba",               30.4512, 78.0234, ["Landslide"],              2104,  "High-altitude slope · monsoon risk"),
+    ("Barlowganj — Kempty Road",  30.4756, 78.0534, ["Landslide","Wind"],       1420,  "Kempty Falls access road · debris flow"),
+    ("Tyuni — Tons Valley",       30.6712, 77.9234, ["Landslide","Wind"],       1200,  "Upper Tons valley · steep gorge"),
+    ("FRI Campus",                30.3423, 77.9934, ["Heat","Wind"],             680,  "Forest Research Institute · open ground"),
+    ("Raiwala",                   30.0523, 78.0712, ["Heat","Flood"],            380,  "Low-elevation southern block"),
+    ("Haridwar Border — Shyampur",30.0456, 78.0923, ["Flood","Heat"],            312,  "Dehradun–Haridwar boundary"),
+    ("Rishikesh",                 30.0867, 78.2678, ["Flood","Heat","Landslide"],372,  "Ganga gorge · multi-hazard node"),
+    ("Doiwala",                   30.1812, 78.1234, ["Heat","Flood"],            480,  "Low-elevation block · heat exposure"),
+    ("Jolly Grant Airport",       30.1889, 78.1804, ["Wind","Flood"],            565,  "Runway operations · gust-sensitive"),
+    ("Mussoorie Ridge",           30.4589, 78.0823, ["Wind","Landslide"],       2000,  "Exposed ridge · orographic wind channel"),
+    ("Chakrata",                  30.6945, 77.8678, ["Wind","Landslide"],       2118,  "High plateau · wind + slide exposure"),
+    ("Kaulagarh",                 30.4312, 78.0923, ["Wind","Landslide"],       1680,  "Ridge above Dehradun · wind-exposed saddle"),
+    ("Tiuni",                     30.7123, 77.8234, ["Wind","Landslide"],       1580,  "Northern ridge corridor · Tons valley wind"),
+    ("AIIMS Rishikesh",           30.1234, 78.2156, ["Flood","Heat"],            350,  "Critical health facility · flood exposure"),
+    ("Railway Station Dehradun",  30.3189, 78.0345, ["Flood","Heat"],           635,  "Transport hub · evacuation node"),
+    ("Selaqui Industrial Area",   30.3512, 77.8823, ["Flood","Wind"],           655,  "Industrial zone · Suswa floodplain"),
+    ("Premnagar Barrage",         30.2867, 78.0023, ["Flood"],                   620,  "Water control structure · Rispana"),
+]
+
+
 def load_roi():
     if GPKG_PATH.exists():
         return gpd.read_file(str(GPKG_PATH)).to_crs(epsg=4326)
     from shapely.geometry import box
-    return gpd.GeoDataFrame(geometry=[box(77.95,30.20,78.15,30.45)],crs="EPSG:4326")
+    return gpd.GeoDataFrame(geometry=[box(77.57, 29.96, 78.33, 31.05)], crs="EPSG:4326")
+
 
 def generate_risk_points(roi_gdf, risk, n=60):
+    """Named risk points from DEHRADUN_LOCATIONS, filtered per hazard."""
+    rng  = np.random.default_rng(42)
     geom = roi_gdf.geometry.iloc[0]
-    minx,miny,maxx,maxy = geom.bounds
-    rng = np.random.default_rng(int(datetime.utcnow().timestamp())%1000)
-    out = {}
+    out  = {}
     for hazard, base in risk.items():
-        pts,vals=[],[]
-        attempts=0
-        while len(pts)<n and attempts<n*5:
-            attempts+=1
-            p = Point(rng.uniform(minx,maxx),rng.uniform(miny,maxy))
-            if geom.contains(p):
-                pts.append(p)
-                vals.append(float(np.clip(rng.normal(base,.15),0,1)))
-        out[hazard] = gpd.GeoDataFrame({"risk":vals},geometry=pts,crs="EPSG:4326")
+        rows = [(name, lat, lon, elev, notes)
+                for name, lat, lon, hazards, elev, notes in DEHRADUN_LOCATIONS
+                if hazard in hazards]
+        names, lats, lons, elevs, notes_list, vals = [], [], [], [], [], []
+        for name, lat, lon, elev, notes in rows:
+            lat_j = lat + rng.uniform(-0.005, 0.005)
+            lon_j = lon + rng.uniform(-0.005, 0.005)
+            elev_factor = 0.0
+            if hazard == "Wind":      elev_factor =  (elev - 640) / 3000
+            elif hazard == "Landslide": elev_factor = (elev - 640) / 4000
+            elif hazard == "Heat":    elev_factor = -(elev - 640) / 5000
+            score = float(np.clip(rng.normal(base + elev_factor, 0.10), 0, 1))
+            names.append(name); lats.append(lat_j); lons.append(lon_j)
+            elevs.append(elev); notes_list.append(notes); vals.append(score)
+        pts = [Point(lo, la) for la, lo in zip(lats, lons)]
+        out[hazard] = gpd.GeoDataFrame(
+            {"name": names, "risk": vals, "elevation": elevs, "notes": notes_list},
+            geometry=pts, crs="EPSG:4326")
     return out
 
+
 def risk_color(r):
-    if r>=.75: return "#e84040"
-    if r>=.50: return "#f06830"
-    if r>=.25: return "#f0a500"
+    if r >= .75: return "#e84040"
+    if r >= .50: return "#f06830"
+    if r >= .25: return "#f0a500"
     return "#00c9a7"
 
-def build_map(roi_gdf, hazard_pts, active_layers):
-    m = folium.Map(location=[30.32,78.03],zoom_start=10,tiles=None)
-    folium.TileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-                     attr="© OSM © CartoDB",name="Dark",max_zoom=19).add_to(m)
-    folium.GeoJson(roi_gdf.__geo_interface__,name="District Boundary",
-        style_function=lambda _: {"fillColor":"none","color":"#f0a500","weight":1.5,"dashArray":"6 4","fillOpacity":0}).add_to(m)
-    emoji={"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰️"}
+
+def _risk_label(r):
+    if r >= .75: return "CRITICAL"
+    if r >= .50: return "HIGH"
+    if r >= .25: return "MODERATE"
+    return "LOW"
+
+
+def _popup_html(hazard, name, risk, elev, notes):
+    color = risk_color(risk)
+    level = _risk_label(risk)
+    em    = {"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰"}.get(hazard, "⚠️")
+    bar_w = int(risk * 100)
+    return f"""
+<div style="font-family:'JetBrains Mono',monospace;background:#111318;
+            border:1px solid #2a2f3d;border-radius:6px;padding:10px 13px;
+            min-width:210px;max-width:250px;">
+  <div style="font-size:11px;font-weight:700;color:#e8ecf4;margin-bottom:4px;">{em} {name}</div>
+  <div style="font-size:9px;color:#8a93a8;margin-bottom:8px;line-height:1.5;">{notes}</div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+    <span style="font-size:9px;color:#8a93a8;text-transform:uppercase;letter-spacing:.08em;">{hazard} Risk</span>
+    <span style="font-size:11px;font-weight:700;color:{color};">{level}</span>
+  </div>
+  <div style="background:#1e2230;border-radius:3px;height:4px;margin-bottom:6px;">
+    <div style="width:{bar_w}%;height:4px;background:{color};border-radius:3px;"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;">
+    <span style="font-size:9px;color:#4e5568;">Score: <b style="color:{color};">{risk:.2f}</b></span>
+    <span style="font-size:9px;color:#4e5568;">Elev: <b style="color:#8a93a8;">{elev}m</b></span>
+  </div>
+</div>"""
+
+
+def build_map(roi_gdf, hazard_pts, active_layers, show_blocks=True):
+    m = folium.Map(location=[30.32, 78.03], zoom_start=10, tiles=None)
+    folium.TileLayer(
+        "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+        attr="© OSM © CartoDB", name="Dark", max_zoom=19,
+    ).add_to(m)
+
+    # ── District boundary ─────────────────────────────────────────
+    folium.GeoJson(
+        roi_gdf.__geo_interface__, name="District Boundary",
+        style_function=lambda _: {
+            "fillColor": "none", "color": "#f0a500",
+            "weight": 2.5, "dashArray": "none", "fillOpacity": 0,
+        },
+    ).add_to(m)
+
+    # ── Block Voronoi cells ───────────────────────────────────────
+    if show_blocks:
+        block_layer = folium.FeatureGroup(name="Blocks", show=True)
+        vor_cells   = _build_block_voronoi(roi_gdf)
+
+        for bname, info in DEHRADUN_BLOCKS.items():
+            geom = vor_cells.get(bname)
+            if geom is None:
+                continue
+            color  = info["color"]
+            a_txt  = str(info["area_km2"]) + " km2"
+            v_txt  = str(info["villages"])
+            notes  = info["notes"]
+
+            # Build popup HTML without any backslash inside string expressions
+            p = (
+                "<div style='background:#111318;border:1px solid "
+                + color
+                + ";border-radius:6px;padding:10px 14px;min-width:185px;'>"
+                "<div style='font-size:13px;font-weight:700;color:"
+                + color
+                + ";margin-bottom:5px;'>"
+                + bname
+                + " Block</div>"
+                "<div style='font-size:9px;color:#8a93a8;"
+                "margin-bottom:8px;line-height:1.6;'>"
+                + notes
+                + "</div>"
+                "<div style='display:flex;justify-content:"
+                "space-between;font-size:9px;'>"
+                "<span style='color:#4e5568;'>Area "
+                "<b style='color:#8a93a8;'>" + a_txt + "</b></span>"
+                "<span style='color:#4e5568;'>Villages "
+                "<b style='color:#8a93a8;'>" + v_txt + "</b></span>"
+                "</div></div>"
+            )
+
+            label = (
+                "<div style='font-family:monospace;font-size:10px;"
+                "font-weight:700;letter-spacing:.06em;"
+                "text-transform:uppercase;color:"
+                + color
+                + ";text-shadow:0 0 8px #000,0 0 4px #000;"
+                "white-space:nowrap;pointer-events:none;'>"
+                + bname
+                + "</div>"
+            )
+
+            folium.GeoJson(
+                geom.__geo_interface__,
+                style_function=lambda _, c=color: {
+                    "color": c, "weight": 1.2, "opacity": 0.7,
+                    "fillColor": c, "fillOpacity": 0.07, "dashArray": "4 6",
+                },
+                highlight_function=lambda _, c=color: {
+                    "color": c, "weight": 2.0, "fillOpacity": 0.18,
+                },
+                popup=folium.Popup(p, max_width=240),
+            ).add_to(block_layer)
+
+            folium.Marker(
+                location=[info["label_lat"], info["label_lon"]],
+                icon=folium.DivIcon(
+                    html=label,
+                    icon_size=(120, 18),
+                    icon_anchor=(60, 9),
+                ),
+            ).add_to(block_layer)
+
+        block_layer.add_to(m)
+
+    # ── Hazard point layers ───────────────────────────────────────
+    haz_emoji = {"Flood": "Flood", "Heat": "Heat",
+                 "Wind": "Wind", "Landslide": "Landslide"}
     for hazard, gdf in hazard_pts.items():
-        if hazard not in active_layers: continue
-        layer = folium.FeatureGroup(name=f"{emoji.get(hazard,'')} {hazard}")
-        for _,row in gdf.iterrows():
-            color = risk_color(row["risk"])
-            folium.CircleMarker([row.geometry.y,row.geometry.x],radius=5+row["risk"]*6,
-                color=color,fill=True,fill_color=color,fill_opacity=.75,weight=0,
-                popup=folium.Popup(f"<span style='font-family:monospace;font-size:11px'><b>{hazard}</b><br>Risk:{row['risk']:.2f}</span>",max_width=160)
+        if hazard not in active_layers:
+            continue
+        layer = folium.FeatureGroup(name=hazard)
+        for _, row in gdf.iterrows():
+            color     = risk_color(row["risk"])
+            radius    = 6 + row["risk"] * 7
+            loc_name  = str(row.get("name", hazard))
+            loc_elev  = int(row.get("elevation", 0))
+            loc_notes = str(row.get("notes", ""))
+            loc_risk  = float(row["risk"])
+            rlabel    = _risk_label(loc_risk)
+            sc_txt    = "{:.2f}".format(loc_risk)
+
+            tip = (
+                "<div style='font-family:monospace;background:#111318;"
+                "border:1px solid #2a2f3d;border-radius:5px;"
+                "padding:5px 9px;line-height:1.6;'>"
+                "<div style='font-size:11px;font-weight:700;color:#e8ecf4;'>"
+                + hazard + " - " + loc_name
+                + "</div>"
+                "<div style='font-size:10px;color:"
+                + color
+                + ";font-weight:600;text-transform:uppercase;"
+                "letter-spacing:.07em;'>"
+                + rlabel + " " + hazard + " Risk"
+                + "</div>"
+                "<div style='font-size:9px;color:#4e5568;margin-top:1px;'>"
+                "Score " + sc_txt + " - " + str(loc_elev) + "m elev"
+                "</div></div>"
+            )
+
+            folium.CircleMarker(
+                [row.geometry.y, row.geometry.x],
+                radius=radius,
+                color=color, fill=True, fill_color=color,
+                fill_opacity=0.80, weight=1.5,
+                tooltip=folium.Tooltip(tip, sticky=True),
+                popup=folium.Popup(
+                    _popup_html(hazard, loc_name, loc_risk,
+                                loc_elev, loc_notes),
+                    max_width=270,
+                ),
             ).add_to(layer)
         layer.add_to(m)
+
     folium.LayerControl(collapsed=False).add_to(m)
     return m
-
 
 # ============================================================
 # PDF EXPORT
@@ -766,8 +1081,9 @@ def render_sidebar():
 
         st.markdown('<div class="section-label" style="margin-top:1rem;">Map Layers</div>',
                     unsafe_allow_html=True)
+        show_blocks  = st.checkbox("Block Boundaries", value=True, key="layer_blocks")
         active_layers = [haz for haz,em in
-                          [("Flood","🌊"),("Heat","🔥"),("Wind","💨"),("Landslide","⛰️")]
+                          [("Flood","🌊"),("Heat","🔥"),("Wind","💨"),("Landslide","⛰")]
                           if st.checkbox(f"{em} {haz}", value=True, key=f"layer_{haz}")]
 
         st.markdown('<div class="section-label" style="margin-top:1rem;">Data Source</div>',
@@ -781,7 +1097,7 @@ def render_sidebar():
             '04 · DecisionAgent<br>05 · EvaluationAgent</div>',
             unsafe_allow_html=True)
 
-    return horizon, rain_thresh, temp_thresh, wind_thresh, active_layers, use_live
+    return horizon, rain_thresh, temp_thresh, wind_thresh, active_layers, use_live, show_blocks
 
 
 def render_header(source, horizon):
@@ -836,7 +1152,7 @@ def render_action_cards(actions):
         lvl = act["Level"]
         lo,hi = act["Confidence"]
         bar_color = {"critical":"#e84040","high":"#f06830","moderate":"#f0a500","low":"#00c9a7"}.get(lvl,"#8a93a8")
-        emoji = {"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰️"}.get(act["Hazard"],"⚠️")
+        emoji = {"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰"}.get(act["Hazard"],"⚠️")
         st.markdown(f"""
         <div class="risk-card {lvl}">
           <div class="risk-card-header">
@@ -878,6 +1194,426 @@ def render_agent_trace(source, n_actions, eval_done=False):
                  f'<span style="color:var(--text2)">{msg}</span></div>')
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+
+
+# ============================================================
+# RECOMMENDATIONS TAB
+# ============================================================
+def _build_recommendations(blended, risk, risk_ci, horizon):
+    """
+    Derive structured, forecast-driven recommendations from the blended
+    72-h timeseries and hazard risk scores.
+    Returns a list of recommendation dicts with full context.
+    """
+    df = blended.copy()
+    recs = []
+
+    # ── Temporal analysis helpers ───────────────────────────────
+    now = df["time"].iloc[0]
+
+    def peak_window(series, label, unit, thresh=None):
+        """Return hour index and value of the peak, plus a window description."""
+        idx  = series.idxmax()
+        val  = series.max()
+        t    = df["time"].iloc[idx]
+        hrs  = int((t - now).total_seconds() / 3600)
+        when = f"in ~{hrs}h" if hrs > 2 else "within 2h"
+        return val, t, when
+
+    rain_peak, rain_t, rain_when = peak_window(df["rain_adj"], "rain", "mm/hr")
+    temp_peak, temp_t, temp_when = peak_window(df["heat_index"], "temp", "°C")
+    wind_peak, wind_t, wind_when = peak_window(df["wind_kmph"], "wind", "km/h")
+    flood_peak, flood_t, flood_when = peak_window(df["flood_proxy"], "flood", "mm/6h")
+
+    # Rolling stats
+    rain_24h  = df["rain_adj"].head(24).sum()
+    rain_72h  = df["rain_adj"].sum()
+    temp_hrs_above_35 = int((df["heat_index"] > 35).sum())
+    temp_hrs_above_40 = int((df["heat_index"] > 40).sum())
+    wind_gusts_above_50 = int((df["wind_kmph"] > 50).sum())
+    consec_rain = 0  # longest consecutive rainy hours
+    cur = 0
+    for v in df["rain_adj"]:
+        if v > 2.0: cur += 1; consec_rain = max(consec_rain, cur)
+        else: cur = 0
+
+    # ── 1. FLOOD RECOMMENDATIONS ─────────────────────────────────
+    flood_score = risk["Flood"]
+    if flood_score >= 0.25:
+        level = "critical" if flood_score>=.75 else "high" if flood_score>=.50 else "moderate"
+        # Primary flood rec
+        recs.append({
+            "id": "FL-01",
+            "hazard": "Flood", "level": level,
+            "title": "Activate Flood Early Warning Protocol",
+            "body": (f"Rainfall forecast peaks at <b>{rain_peak:.1f} mm/hr</b> {rain_when}. "
+                     f"Cumulative 24h accumulation: <b>{rain_24h:.0f} mm</b>. "
+                     f"Flood proxy (6h rolling): <b>{flood_peak:.0f} mm</b>. "
+                     f"Rispana & Bindal river corridors at elevated inundation risk."),
+            "actions": [
+                "Alert drainage & pumping crews for low-lying wards (Prem Nagar, Niranjanpur)",
+                f"Monitor Rispana/Bindal levels every 2h during peak window ({rain_when})",
+                "Pre-position rescue boats at ISBT and Railway Station zones",
+            ],
+            "forecast_basis": f"Rain adj peak {rain_peak:.1f} mm/hr · 24h total {rain_24h:.0f} mm · flood proxy {flood_peak:.0f} mm",
+            "confidence": risk_ci["Flood"],
+        })
+        if rain_24h > 50 or flood_score >= 0.5:
+            recs.append({
+                "id": "FL-02",
+                "hazard": "Flood", "level": level,
+                "title": "Bridge & Road Closure Advisory",
+                "body": (f"Sustained rainfall over {consec_rain}h expected. "
+                         f"River crossings at Rispana (Patel Nagar) and Bindal (Ladpur) "
+                         f"likely to exceed safe crossing threshold within the forecast window."),
+                "actions": [
+                    "Close Rispana bridge at Patel Nagar if stage exceeds 1.5m",
+                    "Deploy traffic diversion at Ladpur crossing (NH-707 alternate route)",
+                    "Issue public advisory: avoid Rajpur Road underpasses during peak rain",
+                ],
+                "forecast_basis": f"Consecutive rain hours: {consec_rain}h · 72h total: {rain_72h:.0f} mm",
+                "confidence": risk_ci["Flood"],
+            })
+
+    # ── 2. HEAT RECOMMENDATIONS ──────────────────────────────────
+    heat_score = risk["Heat"]
+    if heat_score >= 0.25:
+        level = "critical" if heat_score>=.75 else "high" if heat_score>=.50 else "moderate"
+        recs.append({
+            "id": "HT-01",
+            "hazard": "Heat", "level": level,
+            "title": "Heat Health Advisory — Urban Core",
+            "body": (f"Heat index peaks at <b>{temp_peak:.1f}°C</b> {temp_when}. "
+                     f"<b>{temp_hrs_above_35}h</b> forecast above 35°C; "
+                     f"<b>{temp_hrs_above_40}h</b> above 40°C. "
+                     f"High-density zones (Paltan Bazaar, Dalanwala) at elevated health risk."),
+            "actions": [
+                f"Open cooling centres at Clock Tower & FRI campus ({temp_when} onwards)",
+                "Issue IMD heat wave advisory via Dehradun All India Radio & local alerts",
+                "Halt outdoor construction & road work 11:00–17:00 IST on peak days",
+            ],
+            "forecast_basis": f"HI peak {temp_peak:.1f}°C · Hours >35°C: {temp_hrs_above_35} · Hours >40°C: {temp_hrs_above_40}",
+            "confidence": risk_ci["Heat"],
+        })
+        if temp_hrs_above_35 > 12:
+            recs.append({
+                "id": "HT-02",
+                "hazard": "Heat", "level": level,
+                "title": "Vulnerable Population Outreach",
+                "body": (f"Extended heat exposure ({temp_hrs_above_35}h above 35°C) increases "
+                         f"risk for elderly, outdoor workers, and construction labour. "
+                         f"Rishikesh & Doiwala (low-elevation, <400m) face highest thermal load."),
+                "actions": [
+                    "Deploy mobile medical teams to Haridwar Border & Raiwala zones",
+                    "Increase ambulance standby at AIIMS Rishikesh and Paltan Bazaar",
+                    "Coordinate with NDRF for welfare checks in slum clusters",
+                ],
+                "forecast_basis": f"Doiwala/Rishikesh temp_peak {temp_peak:.1f}°C · extended duration {temp_hrs_above_35}h",
+                "confidence": risk_ci["Heat"],
+            })
+
+    # ── 3. WIND RECOMMENDATIONS ──────────────────────────────────
+    wind_score = risk["Wind"]
+    if wind_score >= 0.25:
+        level = "critical" if wind_score>=.75 else "high" if wind_score>=.50 else "moderate"
+        recs.append({
+            "id": "WD-01",
+            "hazard": "Wind", "level": level,
+            "title": "Ridge & Airport Wind Operations Advisory",
+            "body": (f"Wind speed forecast peaks at <b>{wind_peak:.1f} km/h</b> {wind_when}. "
+                     f"<b>{wind_gusts_above_50} hours</b> forecast above 50 km/h. "
+                     f"Mussoorie Ridge (2000m) and Chakrata Plateau (2118m) at highest exposure."),
+            "actions": [
+                f"Notify Jolly Grant Airport ATC: gusts forecast {wind_peak:.0f} km/h {wind_when}",
+                "Secure loose infrastructure on Mussoorie Road and Kempty Falls corridor",
+                "Issue falling-tree advisory for Rajpur Road canopy zone",
+            ],
+            "forecast_basis": f"Wind peak {wind_peak:.1f} km/h · Hours >50 km/h: {wind_gusts_above_50}",
+            "confidence": risk_ci["Wind"],
+        })
+        if wind_gusts_above_50 > 6:
+            recs.append({
+                "id": "WD-02",
+                "hazard": "Wind", "level": level,
+                "title": "Power Infrastructure Protection",
+                "body": (f"Sustained high winds ({wind_gusts_above_50}h above 50 km/h) risk "
+                         f"transmission line damage on exposed ridge corridors above 1500m. "
+                         f"Selaqui Industrial Area and FRI campus are key load centres to protect."),
+                "actions": [
+                    "Pre-position UPCL linemen crews at Chakrata and Vikasnagar substations",
+                    "Reduce load on ridge transmission lines before forecast peak",
+                    "Activate backup power protocols for Dehradun Railway Station & AIIMS",
+                ],
+                "forecast_basis": f"Hours >50 km/h: {wind_gusts_above_50} · peak {wind_peak:.1f} km/h",
+                "confidence": risk_ci["Wind"],
+            })
+
+    # ── 4. LANDSLIDE RECOMMENDATIONS ────────────────────────────
+    ls_score = risk["Landslide"]
+    if ls_score >= 0.25:
+        level = "critical" if ls_score>=.75 else "high" if ls_score>=.50 else "moderate"
+        recs.append({
+            "id": "LS-01",
+            "hazard": "Landslide", "level": level,
+            "title": "Landslide-Prone Corridor Inspection",
+            "body": (f"Flood proxy of <b>{flood_peak:.0f} mm</b> and {consec_rain}h sustained "
+                     f"rainfall saturate slopes. NH-707 (Chakrata–Vikasnagar) and Mussoorie Road "
+                     f"(Kimberley section, slope >30°) are highest-priority corridors."),
+            "actions": [
+                "Dispatch road inspection teams to NH-707 Kalsi–Chakrata stretch",
+                "Close Mussoorie Road Kimberley section if rain >30mm/6h sustained",
+                "Alert Sahastradhara zone residents — active slide history confirmed",
+            ],
+            "forecast_basis": f"Flood proxy {flood_peak:.0f} mm · consec rain {consec_rain}h · LS score {ls_score:.0%}",
+            "confidence": risk_ci["Landslide"],
+        })
+        if rain_72h > 80 or ls_score >= 0.5:
+            recs.append({
+                "id": "LS-02",
+                "hazard": "Landslide", "level": level,
+                "title": "High-Slope Settlement Evacuation Readiness",
+                "body": (f"72h cumulative rainfall forecast: <b>{rain_72h:.0f} mm</b>. "
+                         f"Slope >35° zones in Tyuni–Tons Valley and Benog Tibba "
+                         f"(2104m) face high debris flow probability under sustained saturation."),
+                "actions": [
+                    "Identify evacuation routes for Mussorie–Landour settlements (slopes >35°)",
+                    "Deploy geo-monitoring sensors at Sahastradhara and Maldevta",
+                    "Pre-brief SDRF teams at Chakrata and Vikasnagar block HQs",
+                ],
+                "forecast_basis": f"72h rain {rain_72h:.0f} mm · slope >35° zones active",
+                "confidence": risk_ci["Landslide"],
+            })
+
+    # ── 5. COMPOUND / MULTI-HAZARD ───────────────────────────────
+    active_hazards = [h for h,s in risk.items() if s >= 0.25]
+    if len(active_hazards) >= 3:
+        recs.append({
+            "id": "MH-01",
+            "hazard": "Multi-Hazard", "level": "high",
+            "title": "Compound Event — Coordinated EOC Activation",
+            "body": (f"<b>{len(active_hazards)} simultaneous hazards</b> above threshold: "
+                     f"{', '.join(active_hazards)}. "
+                     f"Compound events amplify cascading risk — flood + landslide on NH-707 "
+                     f"isolates Chakrata block. Heat + wind accelerates fire risk on ridges."),
+            "actions": [
+                "Activate Dehradun District EOC to Level 2 alert",
+                "Coordinate SDRF pre-deployment across Chakrata, Doiwala, and Rishikesh tehsils",
+                "Establish communication links with NDRF Roorkee for rapid response readiness",
+                "Issue unified public advisory across all hazard categories via NDMA App & DD News",
+            ],
+            "forecast_basis": f"Active hazards: {', '.join(active_hazards)} · horizon: {horizon}h",
+            "confidence": (0.45, 0.75),
+        })
+
+    # Sort: critical first, then high, moderate
+    order = {"critical":0,"high":1,"moderate":2}
+    recs.sort(key=lambda r: order.get(r["level"],3))
+    return recs
+
+
+def render_recommendations_tab(blended, risk, risk_ci, horizon):
+    """Full recommendations panel driven by the forecast timeseries."""
+
+    recs = _build_recommendations(blended, risk, risk_ci, horizon)
+
+    # ── Summary banner ────────────────────────────────────────────
+    n_crit = sum(1 for r in recs if r["level"]=="critical")
+    n_high = sum(1 for r in recs if r["level"]=="high")
+    n_mod  = sum(1 for r in recs if r["level"]=="moderate")
+    total  = len(recs)
+
+    if total == 0:
+        st.markdown("""
+        <div style="background:#111318;border:1px solid #00c9a7;border-radius:8px;
+                    padding:1.2rem 1.5rem;margin-bottom:1rem;">
+          <div style="font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;
+                      color:#00c9a7;margin-bottom:.4rem;">✓ All Clear — No Active Recommendations</div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;color:#8a93a8;">
+            All hazard scores below action threshold for the forecast window.
+            Continue routine monitoring.
+          </div>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    _mono = "font-family:'JetBrains Mono',monospace;font-size:.68rem;padding:3px 10px;border-radius:4px;"
+    badge_crit = ("<span style='" + _mono + "background:rgba(232,64,64,.12);color:#e84040;border:1px solid rgba(232,64,64,.3);'>" + str(n_crit) + " CRITICAL</span>") if n_crit else ""
+    badge_high = ("<span style='" + _mono + "background:rgba(240,104,48,.12);color:#f06830;border:1px solid rgba(240,104,48,.3);'>" + str(n_high) + " HIGH</span>") if n_high else ""
+    badge_mod  = ("<span style='" + _mono + "background:rgba(240,165,0,.12);color:#f0a500;border:1px solid rgba(240,165,0,.3);'>"  + str(n_mod)  + " MODERATE</span>") if n_mod else ""
+    banner_color = "#e84040" if n_crit else "#f06830" if n_high else "#f0a500"
+    st.markdown(f"""
+    <div style="background:#111318;border:1px solid {banner_color};border-radius:8px;
+                padding:1rem 1.4rem;margin-bottom:1.2rem;
+                display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;">
+      <div>
+        <div style="font-family:'Syne',sans-serif;font-size:.95rem;font-weight:800;color:{banner_color};">
+          {total} Active Recommendation{"s" if total!=1 else ""} · Next {horizon}h Forecast
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:.65rem;color:#8a93a8;margin-top:3px;">
+          Derived from Open-Meteo forecast · terrain-blended · hazard-threshold analysis
+        </div>
+      </div>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+        {badge_crit}{badge_high}{badge_mod}
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Forecast Snapshot row ─────────────────────────────────────
+    df = blended
+    st.markdown('<div class="section-label">Forecast Snapshot Driving Recommendations</div>',
+                unsafe_allow_html=True)
+    snap_cols = st.columns(5)
+    snaps = [
+        ("🌧 Rain Peak",      f"{df['rain_adj'].max():.1f}",   "mm/hr"),
+        ("🌡 Heat Index Peak",f"{df['heat_index'].max():.1f}", "°C"),
+        ("💨 Wind Peak",      f"{df['wind_kmph'].max():.1f}",  "km/h"),
+        ("🌊 Flood Proxy",    f"{df['flood_proxy'].max():.0f}","mm/6h"),
+        ("⏱ Horizon",        str(horizon),                     "hours"),
+    ]
+    for col, (label, val, unit) in zip(snap_cols, snaps):
+        col.metric(label, val, unit)
+
+    st.markdown("<div style='margin-top:1rem'/>", unsafe_allow_html=True)
+
+    # ── Group by hazard ───────────────────────────────────────────
+    hazard_groups = {}
+    for r in recs:
+        hazard_groups.setdefault(r["hazard"], []).append(r)
+
+    haz_colors = {
+        "Flood":"#00c9a7","Heat":"#e84040","Wind":"#f0a500",
+        "Landslide":"#a78bfa","Multi-Hazard":"#f06830"
+    }
+    haz_emoji  = {
+        "Flood":"🌊","Heat":"🔥","Wind":"💨",
+        "Landslide":"⛰","Multi-Hazard":"⚡"
+    }
+    lvl_colors = {"critical":"#e84040","high":"#f06830","moderate":"#f0a500","low":"#00c9a7"}
+
+    for hazard, hrecs in hazard_groups.items():
+        hcolor = haz_colors.get(hazard,"#8a93a8")
+        hemoji = haz_emoji.get(hazard,"⚠️")
+        st.markdown(f"""
+        <div style="font-family:'Syne',sans-serif;font-size:.8rem;font-weight:700;
+                    color:{hcolor};letter-spacing:.04em;text-transform:uppercase;
+                    margin:.9rem 0 .5rem;padding-bottom:.3rem;
+                    border-bottom:1px solid {hcolor}33;">
+          {hemoji} {hazard} Recommendations
+        </div>""", unsafe_allow_html=True)
+
+        for rec in hrecs:
+            lc     = lvl_colors.get(rec["level"],"#8a93a8")
+            lo, hi = rec["confidence"]
+            bar_w  = f"{(hi-lo)*100:.0f}%"
+            bar_lo = f"{lo*100:.0f}%"
+
+            # Action bullets
+            action_html = "".join(
+                f'<div style="display:flex;gap:.5rem;margin:.25rem 0;">'
+                f'<span style="color:{lc};font-size:.75rem;margin-top:.05rem;">▸</span>'
+                f'<span>{a}</span></div>'
+                for a in rec["actions"]
+            )
+
+            st.markdown(f"""
+            <div style="background:#111318;border:1px solid #2a2f3d;border-left:3px solid {lc};
+                        border-radius:6px;padding:1rem 1.2rem;margin-bottom:.65rem;">
+
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;
+                           margin-bottom:.6rem;gap:.5rem;flex-wrap:wrap;">
+                <div>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:.6rem;
+                                color:#4e5568;letter-spacing:.1em;">ID: {rec['id']}</span>
+                  <div style="font-family:'Syne',sans-serif;font-size:.92rem;font-weight:700;
+                               color:#e8ecf4;margin-top:2px;">{rec['title']}</div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:.62rem;
+                              letter-spacing:.1em;text-transform:uppercase;padding:3px 9px;
+                              border-radius:3px;background:{lc}18;color:{lc};
+                              border:1px solid {lc}44;white-space:nowrap;">
+                  {rec['level'].upper()}
+                </span>
+              </div>
+
+              <div style="font-family:'JetBrains Mono',monospace;font-size:.73rem;
+                           color:#8a93a8;line-height:1.75;margin-bottom:.75rem;">
+                {rec['body']}
+              </div>
+
+              <div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;
+                           color:#e8ecf4;margin-bottom:.5rem;">
+                {action_html}
+              </div>
+
+              <div style="margin-top:.65rem;padding-top:.55rem;border-top:1px solid #1e2230;">
+                <div style="font-family:'JetBrains Mono',monospace;font-size:.6rem;
+                             color:#4e5568;margin-bottom:.3rem;">
+                  FORECAST BASIS: {rec['forecast_basis']}
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:.6rem;
+                                text-transform:uppercase;letter-spacing:.08em;
+                                color:#4e5568;min-width:70px;">Confidence</span>
+                  <div style="flex:1;height:3px;background:#1e2230;border-radius:2px;position:relative;">
+                    <div style="position:absolute;top:0;bottom:0;left:{bar_lo};
+                                width:{bar_w};background:{lc};opacity:.7;border-radius:2px;"></div>
+                  </div>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:.6rem;
+                                color:#4e5568;">{lo:.2f}–{hi:.2f}</span>
+                </div>
+              </div>
+
+            </div>""", unsafe_allow_html=True)
+
+    # ── Forecast risk timeline sparkline ─────────────────────────
+    if HAS_PLOTLY:
+        st.markdown("---")
+        st.markdown('<div class="section-label">Risk Evolution — Forecast Window</div>',
+                    unsafe_allow_html=True)
+        C = {"bg":"#111318","grid":"#2a2f3d","text":"#8a93a8"}
+
+        # Compute rolling risk scores across the timeseries
+        rain_thresh_val  = max(1, df["rain_adj"].quantile(.90))
+        temp_thresh_val  = 35.0
+        wind_thresh_val  = 40.0
+
+        flood_ts = np.clip(df["flood_proxy"] / 200, 0, 1)
+        heat_ts  = np.clip((df["heat_index"] - temp_thresh_val) / 15, 0, 1)
+        wind_ts  = np.clip(df["wind_kmph"] / wind_thresh_val, 0, 1)
+        ls_ts    = np.clip(df["flood_proxy"].rolling(12, min_periods=1).sum() / 300, 0, 1)
+
+        fig = go.Figure()
+        traces = [
+            ("Flood Risk",     flood_ts, "#00c9a7"),
+            ("Heat Risk",      heat_ts,  "#e84040"),
+            ("Wind Risk",      wind_ts,  "#f0a500"),
+            ("Landslide Risk", ls_ts,    "#a78bfa"),
+        ]
+        for name, series, color in traces:
+            fig.add_trace(go.Scatter(
+                x=df["time"], y=series,
+                name=name, line=dict(color=color, width=1.8),
+                fill="tozeroy", fillcolor=color.replace("#","rgba(").rstrip(")") if False else f"rgba(0,0,0,0)",
+                mode="lines",
+            ))
+        # Threshold line
+        fig.add_hline(y=0.25, line=dict(color="#4e5568", width=1, dash="dot"),
+                      annotation_text="Action threshold", annotation_font_size=9,
+                      annotation_font_color="#4e5568")
+        ax_style = dict(gridcolor=C["grid"], zeroline=False,
+                        tickfont=dict(family="JetBrains Mono", size=9, color=C["text"]),
+                        title_font=dict(family="JetBrains Mono", size=9, color=C["text"]))
+        fig.update_xaxes(**ax_style)
+        fig.update_yaxes(**ax_style, range=[0,1.05],
+                         tickvals=[0,.25,.50,.75,1.],
+                         ticktext=["0","LOW","MOD","HIGH","CRIT"])
+        fig.update_layout(
+            paper_bgcolor=C["bg"], plot_bgcolor=C["bg"],
+            margin=dict(l=0,r=0,t=20,b=0), height=240,
+            font=dict(family="JetBrains Mono", color=C["text"]),
+            legend=dict(bgcolor="#111318", bordercolor="#2a2f3d", borderwidth=1,
+                        font=dict(family="JetBrains Mono", size=9)),
+        )
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar":False})
 
 
 def render_timeseries(blended):
@@ -936,7 +1672,7 @@ def _plt_fig_to_st(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor="#111318")
     buf.seek(0)
-    st.image(buf, width='stretch')
+    st.image(buf, width="stretch")
     plt.close(fig)
 
 
@@ -964,13 +1700,13 @@ def render_evaluation_tab(eval_results):
         st.markdown('<div class="section-label">Why previous scores were perfect — and what we fixed</div>',
                     unsafe_allow_html=True)
         reg = EvaluationAgent.LEAKAGE_REGISTRY
-        haz_emoji = {"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰️"}
+        haz_emoji = {"Flood":"🌊","Heat":"🔥","Wind":"💨","Landslide":"⛰"}
         for haz, info in reg.items():
             leaked_str = ", ".join(f"<code>{c}</code>" for c in info["leaked"])
             emoji_haz  = haz_emoji.get(haz,"")
             why_txt    = info['why']
             fix_txt    = info['fix']
-            exp_txt    = info['expect']
+            auc_txt    = info['auc_range']
             st.markdown(f"""
             <div class="diag-block">
               <div class="diag-title">{emoji_haz} {haz}</div>
@@ -978,7 +1714,7 @@ def render_evaluation_tab(eval_results):
                 <span class="tag leak">LEAKED</span> {leaked_str}<br>
                 <b>Why:</b> {why_txt}<br>
                 <span class="tag fix">FIX</span> {fix_txt}<br>
-                <span class="tag info">EXPECT</span> {exp_txt}
+                                <span class="tag info">AUC RANGE</span> {auc_txt}
               </div>
             </div>""", unsafe_allow_html=True)
 
@@ -1173,26 +1909,30 @@ def render_evaluation_tab(eval_results):
                             import io
                             # Get test features from df_te
                             df_te = hr.get("df_te")
-                            if df_te is not None and len(feats) > 0 and all(f in df_te.columns for f in feats):
+                            n_features_scaler = best_scaler.n_features_in_
+                            if df_te is not None and len(feats) == n_features_scaler and all(f in df_te.columns for f in feats):
                                 X_test = df_te[feats].values[:300]
-                                Xte_sc = best_scaler.transform(X_test)
-                                ex = shap.TreeExplainer(best_model)
-                                sv = ex.shap_values(Xte_sc)
-                                if isinstance(sv,list): sv = sv[1]
-                                fig2, ax2 = plt.subplots(figsize=(8,4))
-                                shap.summary_plot(sv, Xte_sc, feature_names=feats,
-                                                  max_display=10, plot_type="bar",
-                                                  show=False, color=A)
-                                ax2.set_title(f"SHAP · {hr['display']} · {best}",fontsize=9)
-                                plt.tight_layout()
-                                buf = io.BytesIO()
-                                fig2.savefig(buf,format="png",dpi=110,bbox_inches="tight",facecolor="#111318")
-                                buf.seek(0); st.image(buf, width='stretch')
-                                plt.close(fig2)
+                                if X_test.shape[1] == n_features_scaler:
+                                    Xte_sc = best_scaler.transform(X_test)
+                                    ex = shap.TreeExplainer(best_model)
+                                    sv = ex.shap_values(Xte_sc)
+                                    if isinstance(sv,list): sv = sv[1]
+                                    fig2, ax2 = plt.subplots(figsize=(8,4))
+                                    shap.summary_plot(sv, Xte_sc, feature_names=feats,
+                                                      max_display=10, plot_type="bar",
+                                                      show=False, color=A)
+                                    ax2.set_title(f"SHAP · {hr['display']} · {best}",fontsize=9)
+                                    plt.tight_layout()
+                                    buf = io.BytesIO()
+                                    fig2.savefig(buf,format="png",dpi=110,bbox_inches="tight",facecolor="#111318")
+                                    buf.seek(0); st.image(buf, width="stretch")
+                                    plt.close(fig2)
+                                else:
+                                    st.caption(f"Cannot compute SHAP: feature dimension mismatch ({X_test.shape[1]} vs {n_features_scaler})")
                             else:
-                                st.caption("Cannot compute SHAP: missing test features")
+                                st.caption(f"Cannot compute SHAP: missing test features (required {n_features_scaler}, got {len(feats)})")
                         except Exception as e:
-                            st.caption(f"SHAP error: {e}")
+                            st.caption(f"SHAP error: {str(e)[:100]}")
 
     # ── Model Leaderboard ────────────────────────────────────────
     st.markdown("---")
@@ -1286,7 +2026,7 @@ def render_evaluation_tab(eval_results):
 # MAIN
 # ============================================================
 def main():
-    horizon, rain_thresh, temp_thresh, wind_thresh, active_layers, use_live = render_sidebar()
+    horizon, rain_thresh, temp_thresh, wind_thresh, active_layers, use_live, show_blocks = render_sidebar()
 
     # ── Pipeline ────────────────────────────────────────────────
     ingestion = IngestionAgent()
@@ -1319,8 +2059,9 @@ def main():
     col_map, col_actions = st.columns([1.35,1], gap="medium")
     with col_map:
         st.markdown(f'<div class="section-label">📍 Impact Map · Next {horizon}h</div>', unsafe_allow_html=True)
-        st_folium(build_map(roi, hazard_pts, active_layers),
-                  width=None, height=480, returned_objects=[], key="impact_map")
+        map_key = f"map_{'_'.join(sorted(active_layers))}_{'blk' if show_blocks else 'noblk'}"
+        st_folium(build_map(roi, hazard_pts, active_layers, show_blocks=show_blocks),
+                  width=None, height=480, returned_objects=[], key=map_key)
     with col_actions:
         st.markdown('<div class="section-label">🚨 Action Cards</div>', unsafe_allow_html=True)
         render_action_cards(actions)
@@ -1341,12 +2082,16 @@ def main():
     st.markdown("<div style='margin-top:1.5rem'/>", unsafe_allow_html=True)
     eval_done = bool(st.session_state.get("eval_results"))
 
-    tab_ts, tab_data, tab_eval, tab_trace = st.tabs([
+    tab_rec, tab_ts, tab_data, tab_eval, tab_trace = st.tabs([
+        "💡  Recommendations",
         "📈  Forecast Timeseries",
         "🗂  Raw Data",
         "🤖  Evaluation Agent",
         "⚙️  Agent Trace",
     ])
+
+    with tab_rec:
+        render_recommendations_tab(blended, risk, risk_ci, horizon)
 
     with tab_ts:
         render_timeseries(blended)
