@@ -193,8 +193,8 @@ st.markdown(
 # PATHS
 # ============================================================
 _HERE     = Path(os.path.abspath(__file__)) if "__file__" in dir() else Path.cwd()
-DATA_DIR  = _HERE.parent / "notebooks" / "data" / "output"
-GPKG_PATH = _HERE.parent / "notebooks" / "data" / "data" / "Dehradun.gpkg"
+DATA_DIR  = _HERE.parent / "data" / "output"
+GPKG_PATH = _HERE.parent / "data" / "output" / "Dehradun.gpkg"
 CSV_PATH  = DATA_DIR / "weatherops_feature_table.csv"
 
 
